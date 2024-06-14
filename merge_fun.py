@@ -175,7 +175,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         while not inserts.empty():
             iat = inserts.get()
             for jump in jumps:
-                jcodes = code_ori[jump[0], jump[2]]
+                jcodes = code_ori[jump[0]: jump[2]]
                 jarg = 0
                 for i in range(-1, -len(jcodes), -2):
                     jarg |= opbytes[i] << (abs(i) // 2 * 8)
