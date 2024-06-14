@@ -125,7 +125,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
                     pi = i
                     while bc == opcode.EXTENDED_ARG:
                         pi += 2
-                        bc = code_obj[pi]
+                        bc = code_ori[pi]
                     if bc in opcode.hasjrel:
                         jumps.append((i, len(tmpcodes), pi + 2 - i))
                     try:
