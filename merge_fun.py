@@ -89,11 +89,8 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         "co_linetable": bytes(),
         "co_exceptiontable": bytes(),
         "co_codelen": 0,  # length of bytecode
-        "total_cellvars": 0,  # number of cellvars
     }
     merged_code = list()
-    for func in funcs:
-        context["total_cellvars"] += len(func.__code__.co_cellvars)
 
     # assert that all functions have the same signature.
     context["co_argcount"] = def_argcount if def_argcount is not None else funcs[0].__code__.co_argcount
@@ -116,12 +113,9 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         data["co_nlocals"] = code_obj.co_nlocals
         data["co_stacksize"] = code_obj.co_stacksize
         data["co_varnames"] = code_obj.co_varnames
-        data["same_nlocals"] = 0
         for varname in data["co_varnames"]:
             if varname not in context["co_varnames"]:
                 context["co_varnames"].append(varname)
-            else:
-                data["same_nlocals"] += 1
         data["co_firstlineno"] = code_obj.co_firstlineno
         data["co_cellvars"] = code_obj.co_cellvars
         data["co_freevars"] = code_obj.co_freevars
@@ -144,28 +138,23 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         while i < cl:
             bc = code_ori[i]
             if bc >= opcode.HAVE_ARGUMENT:  # 有参 opcode
-                if bc == opcode.opmap["RESUME"] and idx > 0:
-                    # replace RESUME with (NOP, NOP) in not first function.
-                    tmpcodes.extend([opcode.opmap["NOP"]] * 2)
-                    i += 2
-                else:
-                    pi = i
-                    while bc == opcode.EXTENDED_ARG:
-                        pi += 2
-                        bc = code_ori[pi]
-                    if bc in opcode.hasjrel:
-                        jumps.append([i, len(tmpcodes), pi + 2 - i, 0])
-                    try:
-                        handler = REGISTER_HANDLES[bc]
-                    except:
-                        raise Exception(f"opcode [{bc}]:{opcode.opname[bc]} dont have converter.")
-                    opbytes = code_ori[i: pi + 2]
-                    result, inserted = handler(opbytes, context, data)
-                    tmpcodes.extend(result)
-                    while inserted > 0:
-                        inserts.put(i)
-                        inserted -= 1
-                    i = pi + 2
+                pi = i
+                while bc == opcode.EXTENDED_ARG:
+                    pi += 2
+                    bc = code_ori[pi]
+                if bc in opcode.hasjrel:
+                    jumps.append([i, len(tmpcodes), pi + 2 - i, 0])
+                try:
+                    handler = REGISTER_HANDLES[bc]
+                except:
+                    raise Exception(f"opcode [{bc}]:{opcode.opname[bc]} dont have converter.")
+                opbytes = code_ori[i: pi + 2]
+                result, inserted = handler(opbytes, context, data)
+                tmpcodes.extend(result)
+                while inserted > 0:
+                    inserts.put(i)
+                    inserted -= 1
+                i = pi + 2
             elif bc == opcode.opmap["RETURN_VALUE"] and not is_last:
                 if i < len(code_ori) - 2:
                     # repace return opcode in the middle of the not last function to avoid ending early
@@ -283,7 +272,6 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_consts"].extend(data["co_consts"])
         context["co_cellvars"].extend(data["co_cellvars"])
         context["co_freevars"].extend(data["co_freevars"])
-        context["co_nlocals"] += data["co_nlocals"] - data["same_nlocals"]
         context["co_stacksize"] = max(data["co_stacksize"], context["co_stacksize"])
         context["co_exceptiontable"] += write_exception_table(data["co_exceptiontable"])
         if merged_code:
@@ -307,7 +295,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
 
     # generate merged function.
     context["co_code"] = bytes(merged_code)
-
+    context['co_nlocals'] = len(context['co_varnames'])
     for k, v in context.items():
         if type(v) is list:
             context[k] = tuple(v)
@@ -316,9 +304,9 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_argcount"],  # number of arguments (not including * or ** args)
         context["co_posonlyargcount"],  # int, 函数的仅限位置 形参 的总数（包括具有默认值的参数）
         context["co_kwonlyargcount"],  # int, 函数的仅限关键字 形参 的数量（包括具有默认值的参数
-        context["co_nlocals"],  # number of local varialbes
-        context["co_stacksize"] + 10,  # int, avoid stack overflow
-        # context["co_stacksize"],  # int, 
+        context["co_nlocals"],  # number of local varialbes (except cell)
+        # context["co_stacksize"] + 10,  # int, 取max_stacksize+1, +1 是为了避免内存crash
+        context["co_stacksize"],  # int, 取max_stacksize+1, +1 是为了避免内存crash
         context["co_flags"],  # bitmap: 1=optimized | 2=newlocals | 4=*arg | 8=**arg
         context["co_code"],  # bytes of raw compiled bytecode
         context["co_consts"],  # tuple of constants used in the bytecode
