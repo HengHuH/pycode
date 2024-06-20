@@ -86,6 +86,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         "co_kwonlyargcount": 0,
         "co_stacksize": 0,  # virtual machine stack space required
         "co_flags": 0,
+        "co_linetable": bytes(),
         "co_exceptiontable": bytes(),
         "co_codelen": 0,  # length of bytecode
         "total_cellvars": 0,  # number of cellvars
@@ -100,8 +101,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
     context["co_kwonlyargcount"] = funcs[0].__code__.co_kwonlyargcount
     context["co_flags"] = funcs[0].__code__.co_flags
 
-    idx = 0
-    for func in funcs:
+    for idx, func in enumerate(funcs):
         data = func_info[idx] = {}
         data["func"] = func
         data["idx"] = idx
@@ -125,6 +125,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         data["co_firstlineno"] = code_obj.co_firstlineno
         data["co_cellvars"] = code_obj.co_cellvars
         data["co_freevars"] = code_obj.co_freevars
+        data['co_linetable'] = code_obj.co_linetable
         data["co_exceptiontable"] = parse_exception_table(code_obj)
         data["func_globals"] = func.__globals__
         data["func_defaults"] = func.__defaults__
@@ -133,22 +134,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         code_ori = list(code_obj.co_code)
         # cut tail which is not last function.
         is_last = idx == len(funcs) - 1
-        if not is_last:
-            cl = len(code_ori)
-            tl = 0  # length of tail to cut
-            if (
-                len(code_ori) >= 4
-                and code_ori[-4] == opcode.opmap["LOAD_CONST"]
-                and code_ori[-2] == opcode.opmap["RETURN_VALUE"]
-            ):
-                tl = 4
-            elif code_ori[-2] in (opcode.opmap["RETURN_VALUE"],):
-                tl = 2
-            cl = len(code_ori) - tl
-        else:  # is_last
-            cl = len(code_ori)
-
-        data["co_codelen"] = cl
+        cl = data["co_codelen"] = len(code_ori)
 
         # convert opcode
         tmpcodes = []
@@ -181,27 +167,37 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
                         inserted -= 1
                     i = pi + 2
             elif bc == opcode.opmap["RETURN_VALUE"] and not is_last:
-                # repace return opcode in the middle of the not last function to avoid ending early
-                prev_bc = code_ori[i - 2]
-                if prev_bc == opcode.opmap["LOAD_CONST"]:
-                    tmpcodes = tmpcodes[:-2]
-                    codes = make_jump_forward((cl - i) // 2)
-                    jumps.append([i, len(tmpcodes), len(codes), 0])
-                    tmpcodes.extend(codes)
-                    if len(codes) == 2:
-                        tmpcodes.extend([opcode.opmap["NOP"]] * 2)
+                if i < len(code_ori) - 2:
+                    # repace return opcode in the middle of the not last function to avoid ending early
+                    prev_bc = code_ori[i - 2]
+                    if prev_bc == opcode.opmap["LOAD_CONST"]:
+                        tmpcodes = tmpcodes[:-2]
+                        codes = make_jump_forward((cl - i) // 2)
+                        jumps.append([i, len(tmpcodes), len(codes), 0])
+                        tmpcodes.extend(codes)
+                        if len(codes) == 2:
+                            tmpcodes.extend([opcode.opmap["NOP"]] * 2)
+                        else:
+                            inserted = (len(codes) - 4) // 2
+                        iat = i - 2
                     else:
-                        inserted = (len(codes) - 4) // 2
-                    iat = i - 2
+                        codes = make_jump_forward((cl - i) // 2)
+                        inserted = (len(codes) - 2) // 2
+                        jumps.append([i, len(tmpcodes), len(codes), 0])
+                        tmpcodes.extend(codes)
+                        iat = i
+                    while inserted > 0:
+                        inserts.put(iat)
+                        inserted -= 1
                 else:
-                    codes = make_jump_forward((cl - i) // 2)
-                    inserted = (len(codes) - 2) // 2
-                    jumps.append([i, len(tmpcodes), len(codes), 0])
-                    tmpcodes.extend(codes)
-                    iat = i
-                while inserted > 0:
-                    inserts.put(iat)
-                    inserted -= 1
+                    # replace tail RETURN_VALUE with NOP
+                    prev_bc = code_ori[i - 2]
+                    if prev_bc == opcode.opmap['LOAD_CONST']:
+                        tmpcodes = tmpcodes[:-2]
+                        tmpcodes.extend([opcode.opmap['NOP']] * 4)
+                    else:
+                        tmpcodes.extend([opcode.opmap['NOP']] * 2)
+
                 i += 2
             else:  # opcode with no argument.
                 tmpcodes.extend(code_ori[i : i + 2])
@@ -224,7 +220,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
                 jop = jcodes[-2]
                 cover = True
                 if jop not in backward_jrel:
-                    cover = jump[0] < iat <= jump[0] + jump[2] + jarg * 2
+                    cover = jump[0] < iat < jump[0] + jump[2] + jarg * 2
                 else:
                     cover = jump[0] - jarg * 2 <= iat < jump[0]
 
@@ -309,8 +305,6 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         if data["func_closure"]:
             context["func_closure"].extend(data["func_closure"])
 
-        idx += 1
-
     # generate merged function.
     context["co_code"] = bytes(merged_code)
 
@@ -323,7 +317,8 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_posonlyargcount"],  # int, 函数的仅限位置 形参 的总数（包括具有默认值的参数）
         context["co_kwonlyargcount"],  # int, 函数的仅限关键字 形参 的数量（包括具有默认值的参数
         context["co_nlocals"],  # number of local varialbes
-        context["co_stacksize"] + 10,  # int, 取max_stacksize+1, +1 是为了避免内存crash
+        context["co_stacksize"] + 10,  # int, avoid stack overflow
+        # context["co_stacksize"],  # int, 
         context["co_flags"],  # bitmap: 1=optimized | 2=newlocals | 4=*arg | 8=**arg
         context["co_code"],  # bytes of raw compiled bytecode
         context["co_consts"],  # tuple of constants used in the bytecode
@@ -333,8 +328,8 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         func_name,  # str, function name
         "",  # qualname
         merged_firstlineno,  # 需要能设置firstlino,否则tracy会无法正确识别函数名
-        bytes(),  # encoded mapping of line numbers to bytecode indices
-        context["co_exceptiontable"],  # bytes,  exceptiontable
+        context['co_linetable'],  # co_linetable, encoded mapping of line numbers to bytecode indices
+        context["co_exceptiontable"],  # co_exceptiontable, bytes
         context["co_freevars"],  # the names of the free variables.
         context["co_cellvars"],  # the names of the local variables that are referenced by nested functions.
     )
@@ -612,6 +607,7 @@ def _debug_func(f):
     print(f"co_consts: {co.co_consts}")
     print(f"co_names: {co.co_names}")
     print(f"co_varnames: {co.co_varnames}")
+    print(f"co_linetable: {co.co_linetable}")
     print(f"co_exceptiontable: {co.co_exceptiontable}")
     print(f"co_freevars: {co.co_freevars}")
     print(f"co_cellvars: {co.co_cellvars}")
