@@ -9,6 +9,9 @@ if __name__ == '__main__':
             self.b = 2
             pass
 
+    def f0(self, dt):
+        return [self.b * x for x in [1]]
+
     def f1(self, dt):
         print(self.b)
         print(min(1, 2))
@@ -304,7 +307,7 @@ if __name__ == '__main__':
         finally:
             print("finaly.", dt)
 
-    merge_list = [f1, f_cell, f_extarg, f_exc]
+    merge_list = [f0, f1, f_cell, f_extarg, f_exc]
     for i, fun in enumerate(merge_list):
         print(f"==== merge {i}\n")
         print(f"co_varnames: {fun.__code__.co_varnames}")

@@ -6,7 +6,7 @@ import types
 import opcode
 import queue
 
-assert sys.version_info.major == 3 and sys.version_info.minor == 11, "for python 3.11 and above"
+assert sys.version_info.major == 3 and sys.version_info.minor == 11, "for python 3.11 only."
 
 
 cache_entries = opcode._inline_cache_entries
@@ -112,7 +112,9 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         vns = code.co_varnames
         cvs = code.co_cellvars
         for vn in vns:
-            if vn not in c_vns and vn not in cvs and vn not in c_cvs:
+            if vn not in c_vns and vn in vns and vn in cvs:
+                c_vns.append(vn)
+            elif vn not in c_vns and vn not in cvs and vn not in c_cvs:
                 c_vns.append(vn)
         for cv in cvs:
             if cv not in c_cvs:
