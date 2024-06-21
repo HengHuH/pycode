@@ -19,6 +19,12 @@ backward_jrel = (
     opcode.opmap["POP_JUMP_BACKWARD_IF_TRUE"],
 )
 
+FAST_2_DEREF = {
+    opcode.opmap['LOAD_FAST']: opcode.opmap['LOAD_DEREF'],
+    opcode.opmap['STORE_FAST']: opcode.opmap['STORE_DEREF'],
+    opcode.opmap['DELETE_FAST']: opcode.opmap['DELETE_DEREF'],
+}
+
 
 def _parse_varint(iterator):
     b = next(iterator)
@@ -89,14 +95,47 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         "co_linetable": bytes(),
         "co_exceptiontable": bytes(),
         "co_codelen": 0,  # length of bytecode
+        "slot_mapping_name": [],
+        "name_mapping_slot": {}
     }
-    merged_code = list()
-
     # assert that all functions have the same signature.
     context["co_argcount"] = def_argcount if def_argcount is not None else funcs[0].__code__.co_argcount
     context["co_posonlyargcount"] = funcs[0].__code__.co_posonlyargcount
     context["co_kwonlyargcount"] = funcs[0].__code__.co_kwonlyargcount
     context["co_flags"] = funcs[0].__code__.co_flags
+
+    # merge co_varnames, co_cellvars before convert opcode.
+    c_vns = list()
+    c_cvs = list()
+    for i, func in enumerate(funcs):
+        code = func.__code__
+        vns = code.co_varnames
+        cvs = code.co_cellvars
+        for vn in vns:
+            if vn not in c_vns and vn not in cvs and vn not in c_cvs:
+                c_vns.append(vn)
+        for cv in cvs:
+            if cv not in c_cvs:
+                c_cvs.append(cv)
+                if cv not in vns and cv in c_vns:
+                    c_vns.remove(cv)
+
+    context['co_varnames'] = c_vns
+    context['co_cellvars'] = c_cvs
+
+    names = c_vns + list(set(c_cvs) - set(c_vns))
+    context['slot_mapping_name'] = names
+    for i, name in enumerate(names):
+        context['name_mapping_slot'][name] = i
+
+    merged_code = list()
+    # generate MAKE_CELL
+    for cv in c_cvs:
+        merged_code.append(opcode.opmap['MAKE_CELL'])
+        si = context['name_mapping_slot'][cv]
+        assert 0 <= si < 256, "fast slot index need be in [0, 256)"  # TODO: heng, deal with EXTENDED_ARG?
+        merged_code.append(si)
+    context['co_codelen'] = len(merged_code)
 
     for idx, func in enumerate(funcs):
         data = func_info[idx] = {}
@@ -113,9 +152,6 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         data["co_nlocals"] = code_obj.co_nlocals
         data["co_stacksize"] = code_obj.co_stacksize
         data["co_varnames"] = code_obj.co_varnames
-        for varname in data["co_varnames"]:
-            if varname not in context["co_varnames"]:
-                context["co_varnames"].append(varname)
         data["co_firstlineno"] = code_obj.co_firstlineno
         data["co_cellvars"] = code_obj.co_cellvars
         data["co_freevars"] = code_obj.co_freevars
@@ -124,6 +160,12 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         data["func_globals"] = func.__globals__
         data["func_defaults"] = func.__defaults__
         data["func_closure"] = func.__closure__
+
+        names = list(code_obj.co_varnames) + list(set(code_obj.co_cellvars) - set(code_obj.co_varnames))
+        data['slot_mapping_name'] = names
+        data['name_mapping_slot'] = {}
+        for i, name in enumerate(names):
+            data['name_mapping_slot'][name] = i
 
         code_ori = list(code_obj.co_code)
         # cut tail which is not last function.
@@ -270,7 +312,6 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         if data["co_renames"]:
             context["co_names"].extend(e[1] for e in data["co_renames"])  # extend new names
         context["co_consts"].extend(data["co_consts"])
-        context["co_cellvars"].extend(data["co_cellvars"])
         context["co_freevars"].extend(data["co_freevars"])
         context["co_stacksize"] = max(data["co_stacksize"], context["co_stacksize"])
         context["co_exceptiontable"] += write_exception_table(data["co_exceptiontable"])
@@ -305,8 +346,8 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_posonlyargcount"],  # int, 函数的仅限位置 形参 的总数（包括具有默认值的参数）
         context["co_kwonlyargcount"],  # int, 函数的仅限关键字 形参 的数量（包括具有默认值的参数
         context["co_nlocals"],  # number of local varialbes (except cell)
-        # context["co_stacksize"] + 10,  # int, 取max_stacksize+1, +1 是为了避免内存crash
-        context["co_stacksize"],  # int, 取max_stacksize+1, +1 是为了避免内存crash
+        context["co_stacksize"] + 10,  # int, 取max_stacksize+1, +1 是为了避免内存crash
+        # context["co_stacksize"],  # int, 取max_stacksize+1, +1 是为了避免内存crash
         context["co_flags"],  # bitmap: 1=optimized | 2=newlocals | 4=*arg | 8=**arg
         context["co_code"],  # bytes of raw compiled bytecode
         context["co_consts"],  # tuple of constants used in the bytecode
@@ -433,13 +474,13 @@ def convert_varnames(opbytes, context, data):
     for i in range(-1, -len(opbytes), -2):
         _arg |= opbytes[i] << (abs(i) // 2 * 8)
 
-    if data["co_varnames"][_arg] in context.get("co_varnames"):
-        current = context.get("co_varnames").index(data["co_varnames"][_arg])
+    name = data['co_varnames'][_arg]
+    if name in context['co_cellvars']:
+        _byte = FAST_2_DEREF[_byte]
+        _arg = context['name_mapping_slot'][name]
     else:
-        current = len(context.get("co_varnames"))
-        context.get("co_varnames").append(data.get("co_varnames")[_arg])
+        _arg = context.get("co_varnames").index(name)
 
-    _arg = current
     res = []
     if _arg == 0:
         res = [_byte, 0]
@@ -460,8 +501,8 @@ def convert_closure(opbytes, context, data):
     for i in range(-1, -len(opbytes), -2):
         _arg |= opbytes[i] << (abs(i) // 2 * 8)
 
-    offset = len(context.get("co_cellvars"))
-    _arg += offset
+    name = data['slot_mapping_name'][_arg]
+    _arg = context['name_mapping_slot'][name]
 
     res = []
     if _arg == 0:
@@ -479,6 +520,14 @@ def convert_closure(opbytes, context, data):
 
 def convert_default(opbytes, context, data):
     """参数不做任何变化"""
+    return opbytes, 0
+
+
+def convert_nop(opbytes, context, data):
+    """全部替换为NOP"""
+    for i in range(0, len(opbytes), 2):
+        opbytes[i] = opcode.opmap['NOP']
+        opbytes[i+1] = 0
     return opbytes, 0
 
 
@@ -501,6 +550,7 @@ def make_jump_forward(delta):
 
 
 REGISTER_HANDLES = {
+    opcode.opmap["MAKE_CELL"]: convert_nop,  # MAKE_CELL 提前到最前，中间的使用NOP填，方面处理 hasjrel 指令
     # convert names
     opcode.opmap["STORE_NAME"]: convert_co_names,
     opcode.opmap["DELETE_NAME"]: convert_co_names,
@@ -540,7 +590,6 @@ REGISTER_HANDLES = {
     opcode.opmap["GET_AWAITABLE"]: convert_default,
     opcode.opmap["MAKE_FUNCTION"]: convert_default,
     opcode.opmap["BUILD_SLICE"]: convert_default,
-    opcode.opmap["MAKE_CELL"]: convert_default,
     opcode.opmap["CALL_FUNCTION_EX"]: convert_default,
     # opcode.opmap["EXTENDED_ARG"]: convert_default,
     opcode.opmap["LIST_APPEND"]: convert_default,

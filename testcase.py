@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import dis
 from merge_fun import merge_func
 
 if __name__ == '__main__':
@@ -9,6 +10,7 @@ if __name__ == '__main__':
             pass
 
     def f1(self, dt):
+        print(self.b)
         print(min(1, 2))
         a = 1
         if a:
@@ -21,12 +23,15 @@ if __name__ == '__main__':
             return 4
 
     def f_cell(self, dt):
+        print('a')
         a = 1
+        print('cell_1')
         b = [x * a * self.b for x in range(self.b)]
+        print('cell_2')
         print(b)
 
     def f_extarg(self, dt):
-        print(f"test cell {self.b}")
+        print(f"self.b: {self.b}")
         b = A()
         b.a0 = 0
         b.a1 = 1
@@ -300,7 +305,15 @@ if __name__ == '__main__':
             print("finaly.", dt)
 
     merge_list = [f1, f_cell, f_extarg, f_exc]
+    for i, fun in enumerate(merge_list):
+        print(f"==== merge {i}\n")
+        print(f"co_varnames: {fun.__code__.co_varnames}")
+        print(f"co_cellvars: {fun.__code__.co_cellvars}")
+        dis.dis(fun)
     f_merged = merge_func("f_merge", merge_list)
+    print(f"co_varnames: {f_merged.__code__.co_varnames}")
+    print(f"co_cellvars: {f_merged.__code__.co_cellvars}")
+    dis.dis(f_merged)
 
     print('\n')
     print("--- call each origin function ---")
