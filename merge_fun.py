@@ -8,8 +8,8 @@ import queue
 
 assert sys.version_info.major == 3 and sys.version_info.minor == 11, "for python 3.11 only."
 
-
 cache_entries = opcode._inline_cache_entries
+
 backward_jrel = (
     opcode.opmap["JUMP_BACKWARD_NO_INTERRUPT"],
     opcode.opmap["JUMP_BACKWARD"],
@@ -29,10 +29,10 @@ FAST_2_DEREF = {
 def _parse_varint(iterator):
     b = next(iterator)
     val = b & 63
-    while b&64:
+    while b & 64:
         val <<= 6
         b = next(iterator)
-        val |= b&63
+        val |= b & 63
     return val
 
 
@@ -53,10 +53,10 @@ def parse_exception_table(code):
 
 def _write_varint(bytes, val):
     res = []
-    res.append(val&63)
+    res.append(val & 63)
     val >>= 6
     while val > 0:
-        res.append(64|val&63)
+        res.append(64 | val & 63)
         val >>= 6
     bytes += reversed(res)
 
@@ -81,9 +81,6 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         "co_consts": list(),
         "co_freevars": list(),
         "co_cellvars": list(),
-        "func_globals": dict(),  # __globals__
-        "func_defaults": list(),  # __defaults__
-        "func_closure": list(),  # __closure__
         "co_code": bytes(),
         "co_lnotab": None,
         "co_nlocals": 0,
@@ -95,6 +92,9 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         "co_linetable": bytes(),
         "co_exceptiontable": bytes(),
         "co_codelen": 0,  # length of bytecode
+        "func_globals": dict(),  # __globals__
+        "func_defaults": list(),  # __defaults__
+        "func_closure": list(),  # __closure__
         "slot_mapping_name": [],
         "name_mapping_slot": {}
     }
@@ -112,9 +112,9 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         vns = code.co_varnames
         cvs = code.co_cellvars
         for vn in vns:
-            if vn not in c_vns and vn in vns and vn in cvs:
+            if vn not in c_vns and vn in vns and vn in cvs:  # argument names
                 c_vns.append(vn)
-            elif vn not in c_vns and vn not in cvs and vn not in c_cvs:
+            elif vn not in c_vns and vn not in cvs and vn not in c_cvs:  # local variable names and not cell.
                 c_vns.append(vn)
         for cv in cvs:
             if cv not in c_cvs:
@@ -131,12 +131,14 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context['name_mapping_slot'][name] = i
 
     merged_code = list()
+
     # generate MAKE_CELL
     for cv in c_cvs:
         merged_code.append(opcode.opmap['MAKE_CELL'])
-        si = context['name_mapping_slot'][cv]
-        assert 0 <= si < 256, "fast slot index need be in [0, 256)"  # TODO: heng, deal with EXTENDED_ARG?
-        merged_code.append(si)
+        sloti = context['name_mapping_slot'][cv]
+        assert 0 <= sloti < 256, "fast slot index need be in [0, 256)"  # TODO: heng, deal with EXTENDED_ARG?
+        merged_code.append(sloti)
+
     context['co_codelen'] = len(merged_code)
 
     for idx, func in enumerate(funcs):
@@ -169,84 +171,81 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         for i, name in enumerate(names):
             data['name_mapping_slot'][name] = i
 
-        code_ori = list(code_obj.co_code)
+        cocode = list(code_obj.co_code)
         # cut tail which is not last function.
         is_last = idx == len(funcs) - 1
-        cl = data["co_codelen"] = len(code_ori)
+        cl = data["co_codelen"] = len(cocode)
 
         # convert opcode
-        tmpcodes = []
+        tmpcode = []
         inserts = queue.Queue()
         jumps = []  # record jump opcode
         i = 0
         while i < cl:
-            bc = code_ori[i]
-            if bc >= opcode.HAVE_ARGUMENT:  # 有参 opcode
+            op = cocode[i]
+            if op >= opcode.HAVE_ARGUMENT:  # 有参 opcode
                 pi = i
-                while bc == opcode.EXTENDED_ARG:
+                while op == opcode.EXTENDED_ARG:
                     pi += 2
-                    bc = code_ori[pi]
-                if bc in opcode.hasjrel:
-                    jumps.append([i, len(tmpcodes), pi + 2 - i, 0])
+                    op = cocode[pi]
+                if op in opcode.hasjrel:
+                    jumps.append([i, len(tmpcode), pi + 2 - i, 0])
                 try:
-                    handler = REGISTER_HANDLES[bc]
+                    handler = REGISTER_HANDLES[op]
                 except:
-                    raise Exception(f"opcode [{bc}]:{opcode.opname[bc]} dont have converter.")
-                opbytes = code_ori[i: pi + 2]
-                result, inserted = handler(opbytes, context, data)
-                tmpcodes.extend(result)
-                while inserted > 0:
+                    raise Exception(f"opcode [{op}]:{opcode.opname[op]} dont have converter.")
+                result, inserted = handler(cocode[i: pi + 2], context, data)
+                tmpcode.extend(result)
+                for _ in range(inserted):
                     inserts.put(i)
-                    inserted -= 1
                 i = pi + 2
-            elif bc == opcode.opmap["RETURN_VALUE"] and not is_last:
-                if i < len(code_ori) - 2:
+            elif op == opcode.opmap["RETURN_VALUE"] and not is_last:
+                if i < len(cocode) - 2:
                     # repace return opcode in the middle of the not last function to avoid ending early
-                    prev_bc = code_ori[i - 2]
-                    if prev_bc == opcode.opmap["LOAD_CONST"]:
-                        tmpcodes = tmpcodes[:-2]
+                    pre_op = cocode[i - 2]
+                    if pre_op == opcode.opmap["LOAD_CONST"]:
+                        tmpcode = tmpcode[:-2]
                         codes = make_jump_forward((cl - i) // 2)
-                        jumps.append([i, len(tmpcodes), len(codes), 0])
-                        tmpcodes.extend(codes)
+                        jumps.append([i, len(tmpcode), len(codes), 0])
+                        tmpcode.extend(codes)
                         if len(codes) == 2:
-                            tmpcodes.extend([opcode.opmap["NOP"]] * 2)
+                            tmpcode.extend([opcode.opmap["NOP"]] * 2)
                         else:
                             inserted = (len(codes) - 4) // 2
                         iat = i - 2
                     else:
                         codes = make_jump_forward((cl - i) // 2)
                         inserted = (len(codes) - 2) // 2
-                        jumps.append([i, len(tmpcodes), len(codes), 0])
-                        tmpcodes.extend(codes)
+                        jumps.append([i, len(tmpcode), len(codes), 0])
+                        tmpcode.extend(codes)
                         iat = i
-                    while inserted > 0:
+                    for _ in range(inserted):
                         inserts.put(iat)
-                        inserted -= 1
                 else:
                     # replace tail RETURN_VALUE with NOP
-                    prev_bc = code_ori[i - 2]
-                    if prev_bc == opcode.opmap['LOAD_CONST']:
-                        tmpcodes = tmpcodes[:-2]
-                        tmpcodes.extend([opcode.opmap['NOP']] * 4)
+                    pre_op = cocode[i - 2]
+                    if pre_op == opcode.opmap['LOAD_CONST']:
+                        tmpcode = tmpcode[:-2]
+                        tmpcode.extend([opcode.opmap['NOP']] * 4)
                     else:
-                        tmpcodes.extend([opcode.opmap['NOP']] * 2)
+                        tmpcode.extend([opcode.opmap['NOP']] * 2)
 
                 i += 2
             else:  # opcode with no argument.
-                tmpcodes.extend(code_ori[i : i + 2])
+                tmpcode.extend(cocode[i : i + 2])
                 i += 2
             # CACHE
-            if cache_entries[bc] > 0:
-                tmpcodes.extend(code_ori[i : i + cache_entries[bc] * 2])
-                i += cache_entries[bc] * 2
+            if cache_entries[op] > 0:
+                tmpcode.extend(cocode[i : i + cache_entries[op] * 2])
+                i += cache_entries[op] * 2
 
         # after converted, deal with relative jump opcode.
-        allinserts = []
+        allinserted = []
         while not inserts.empty():
             iat = inserts.get()
-            allinserts.append(iat)
+            allinserted.append(iat)
             for jump in jumps:
-                jcodes = code_ori[jump[0]: jump[0] + jump[2]]
+                jcodes = cocode[jump[0]: jump[0] + jump[2]]
                 jarg = 0
                 for i in range(-1, -len(jcodes), -2):
                     jarg |= jcodes[i] << (abs(i) // 2 * 8)
@@ -270,7 +269,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
             if not jump[3] == 0:
                 jarg = jump[3]
                 cvt = []
-                jop = code_ori[jump[0]: jump[0] + jump[2]][-2]
+                jop = cocode[jump[0]: jump[0] + jump[2]][-2]
                 while jarg > 0:
                     word = jarg & 0xFF
                     jarg = jarg >> 8
@@ -278,7 +277,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
                         cvt = [opcode.EXTENDED_ARG, word] + cvt
                     else:
                         cvt = [jop, word]
-                tmpcodes = tmpcodes[0: jump[1]] + cvt + tmpcodes[jump[1] + jump[2]:]
+                tmpcode = tmpcode[0: jump[1]] + cvt + tmpcode[jump[1] + jump[2]:]
 
         # deal with exception table.
         if data['co_exceptiontable']:
@@ -288,7 +287,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
                 start = entry[0]
                 end = entry[1] - 2
                 target = entry[2]
-                for isa in allinserts:
+                for isa in allinserted:
                     if isa <= start:
                         exc_deltas[i*3+0] += 2
                         exc_deltas[i*3+1] += 2
@@ -309,7 +308,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
                 entry[2] = entry[2] + exc_deltas[i*3+2] + context['co_codelen']
 
         # merge to context.
-        merged_code += tmpcodes
+        merged_code += tmpcode
         context["co_names"].extend(data["co_names"])
         if data["co_renames"]:
             context["co_names"].extend(e[1] for e in data["co_renames"])  # extend new names
@@ -317,10 +316,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_freevars"].extend(data["co_freevars"])
         context["co_stacksize"] = max(data["co_stacksize"], context["co_stacksize"])
         context["co_exceptiontable"] += write_exception_table(data["co_exceptiontable"])
-        if merged_code:
-            context["co_codelen"] = len(merged_code)
-        else:
-            context["co_codelen"] = 0
+        context["co_codelen"] = len(merged_code)
 
         # fix func globals has same key but different value
         if data["func_globals"]:
@@ -376,40 +372,40 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
 
 def convert_co_names(opbytes, context, data):
     """由于合并了co_names,全局变量读取的位置变更"""
-    _arg = 0
-    _byte = opbytes[-2]
+    arg = 0
+    op = opbytes[-2]
     for i in range(-1, -len(opbytes), -2):
-        _arg |= opbytes[i] << (abs(i) // 2 * 8)
+        arg |= opbytes[i] << (abs(i) // 2 * 8)
 
     offset = len(context.get("co_names"))
-    _arg += offset
+    arg += offset
 
     res = []
-    if _arg == 0:
-        res = [_byte, 0]
-    while _arg > 0:
-        word = _arg & 0xFF
-        _arg = _arg >> 8
+    if arg == 0:
+        res = [op, 0]
+    while arg > 0:
+        word = arg & 0xFF
+        arg = arg >> 8
         if res:
             res = [opcode.EXTENDED_ARG, word] + res
         else:
-            res = [_byte, word]
+            res = [op, word]
     return res, (len(res) - len(opbytes)) // 2
 
 
 def convert_co_renames(opbytes, context, data):
     """由于合并了func_globals, co_names, 全局变量读取的位置变更，重命名"""
-    _arg = 0
-    _byte = opbytes[-2]
+    arg = 0
+    op = opbytes[-2]
     for i in range(-1, -len(opbytes), -2):
-        _arg |= opbytes[i] << (abs(i) // 2 * 8)
+        arg |= opbytes[i] << (abs(i) // 2 * 8)
 
     offset = len(context.get("co_names"))
-    has_null = _arg & 0x01
-    if _byte == opcode.opmap["LOAD_GLOBAL"]:
-        namei = _arg >> 1
+    pushnull = arg & 0x01
+    if op == opcode.opmap["LOAD_GLOBAL"]:
+        namei = arg >> 1
     else:
-        namei = _arg
+        namei = arg
 
     name = data["co_names"][namei]
     if (
@@ -426,96 +422,95 @@ def convert_co_renames(opbytes, context, data):
         offset = len(context.get("co_names"))
         current = namei + offset
 
-    if _byte == opcode.opmap["LOAD_GLOBAL"]:
-        namei = (current << 1) | (0x01 if has_null else 0x00)
+    if op == opcode.opmap["LOAD_GLOBAL"]:
+        arg = (current << 1) | (0x01 if pushnull else 0x00)
     else:
-        namei = current
+        arg = current
 
-    _arg = namei
     res = []
-    if _arg == 0:
-        res = [_byte, 0]
-    while _arg > 0:
-        word = _arg & 0xFF
-        _arg = _arg >> 8
+    if arg == 0:
+        res = [op, 0]
+    while arg > 0:
+        word = arg & 0xFF
+        arg = arg >> 8
         if res:
             res = [opcode.EXTENDED_ARG, word] + res
         else:
-            res = [_byte, word]
+            res = [op, word]
 
     return res, (len(res) - len(opbytes)) // 2
 
 
 def convert_co_consts(opbytes, context, data):
     """由于合并了co_consts,常量读取的位置变更"""
-    _arg = 0
-    _byte = opbytes[-2]
+    arg = 0
+    op = opbytes[-2]
     for i in range(-1, -len(opbytes), -2):
-        _arg |= opbytes[i] << (abs(i) // 2 * 8)
+        arg |= opbytes[i] << (abs(i) // 2 * 8)
 
     offset = len(context.get("co_consts"))
-    _arg += offset
+    arg += offset
 
     res = []
-    if _arg == 0:
-        res = [_byte, 0]
-    while _arg > 0:
-        word = _arg & 0xFF
-        _arg = _arg >> 8
+    if arg == 0:
+        res = [op, 0]
+    while arg > 0:
+        word = arg & 0xFF
+        arg = arg >> 8
         if res:
             res = [opcode.EXTENDED_ARG, word] + res
         else:
-            res = [_byte, word]
+            res = [op, word]
     return res, (len(res) - len(opbytes)) // 2
 
 
 def convert_varnames(opbytes, context, data):
     """由于合并了co_varnames,局部变量读取的位置变更"""
-    _arg = 0
-    _byte = opbytes[-2]
+    arg = 0
+    op = opbytes[-2]
     for i in range(-1, -len(opbytes), -2):
-        _arg |= opbytes[i] << (abs(i) // 2 * 8)
+        arg |= opbytes[i] << (abs(i) // 2 * 8)
 
-    name = data['co_varnames'][_arg]
+    name = data['co_varnames'][arg]
     if name in context['co_cellvars']:
-        _byte = FAST_2_DEREF[_byte]
-        _arg = context['name_mapping_slot'][name]
+        op = FAST_2_DEREF[op]
+        arg = context['name_mapping_slot'][name]
     else:
-        _arg = context.get("co_varnames").index(name)
+        arg = context.get("co_varnames").index(name)
 
     res = []
-    if _arg == 0:
-        res = [_byte, 0]
-    while _arg > 0:
-        word = _arg & 0xFF
-        _arg = _arg >> 8
+    if arg == 0:
+        res = [op, 0]
+    while arg > 0:
+        word = arg & 0xFF
+        arg = arg >> 8
         if res:
             res = [opcode.EXTENDED_ARG, word] + res
         else:
-            res = [_byte, word]
+            res = [op, word]
     return res, (len(res) - len(opbytes)) // 2
 
 
 def convert_closure(opbytes, context, data):
     """由于合并了 co_cellvars，cell index 需要变更"""
-    _arg = 0
-    _byte = opbytes[-2]
+    arg = 0
+    op = opbytes[-2]
     for i in range(-1, -len(opbytes), -2):
-        _arg |= opbytes[i] << (abs(i) // 2 * 8)
+        arg |= opbytes[i] << (abs(i) // 2 * 8)
 
-    name = data['slot_mapping_name'][_arg]
-    _arg = context['name_mapping_slot'][name]
+    name = data['slot_mapping_name'][arg]
+    arg = context['name_mapping_slot'][name]
 
     res = []
-    if _arg == 0:
-        res = [_byte, 0]
-    while _arg > 0:
-        word = _arg & 0xFF
-        _arg = _arg >> 8
+    if arg == 0:
+        res = [op, 0]
+    while arg > 0:
+        word = arg & 0xFF
+        arg = arg >> 8
         if res:
             res = [opcode.EXTENDED_ARG, word] + res
         else:
-            res = [_byte, word]
+            res = [op, word]
 
     return res, (len(res) - len(opbytes)) // 2
 
@@ -529,25 +524,23 @@ def convert_nop(opbytes, context, data):
     """全部替换为NOP"""
     for i in range(0, len(opbytes), 2):
         opbytes[i] = opcode.opmap['NOP']
-        opbytes[i+1] = 0
+        opbytes[i + 1] = 0
     return opbytes, 0
 
 
 def make_jump_forward(delta):
-    _byte = opcode.opmap["JUMP_FORWARD"]
-    _arg = delta
-
+    op = opcode.opmap["JUMP_FORWARD"]
+    arg = delta
     res = []
-    if _arg == 0:
-        res = [_byte, 0]
-    while _arg > 0:
-        word = _arg & 0xFF
-        _arg = _arg >> 8
+    if arg == 0:
+        res = [op, 0]
+    while arg > 0:
+        word = arg & 0xFF
+        arg >>= 8
         if res:
             res = [opcode.EXTENDED_ARG, word] + res
         else:
-            res = [_byte, word]
-
+            res = [op, word]
     return res
 
 
