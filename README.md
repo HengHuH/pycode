@@ -10,7 +10,7 @@
 - types.FunctionType 函数类型
 - types.CodeType 代码类型
 - [dis](https://docs.python.org/zh-cn/3.11/library/dis.html) 模块
-- [The bytecode interpreter of Python3.11]https://devguide.python.org/internals/interpreter/#jumps
+- [The bytecode interpreter of Python3.11](https://devguide.python.org/internals/interpreter/#jumps)
 
 ## 可行性
 

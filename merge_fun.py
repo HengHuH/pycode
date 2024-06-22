@@ -6,7 +6,7 @@ import types
 import opcode
 import queue
 
-assert sys.version_info.major == 3 and sys.version_info.minor == 11, "for python 3.11 only."
+assert sys.version_info.major == 3 and sys.version_info.minor == 11, "For python 3.11 only."
 
 cache_entries = opcode._inline_cache_entries
 
