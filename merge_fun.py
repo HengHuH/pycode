@@ -66,11 +66,21 @@ def write_exception_table(enties):
     for entry in enties:
         arr = []
         _write_varint(arr, entry[0] // 2)  # start
+        arr[0] |= 0b1000000
         _write_varint(arr, (entry[1] - entry[0]) // 2)  # length
         _write_varint(arr, entry[2] // 2)  # target
         _write_varint(arr, entry[3])  # depth,lasti
         res += bytes(arr)
     return res
+
+
+def next_entry_index(linetable, start):
+    ret = -1
+    for i in range(start + 1, len(linetable)):
+        if linetable[i] & 0b10000000:
+            ret = i
+            break
+    return ret
 
 
 def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=0):
@@ -96,7 +106,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         "func_defaults": list(),  # __defaults__
         "func_closure": list(),  # __closure__
         "slot_mapping_name": [],
-        "name_mapping_slot": {}
+        "name_mapping_slot": {},
     }
     # assert that all functions have the same signature.
     context["co_argcount"] = def_argcount if def_argcount is not None else funcs[0].__code__.co_argcount
@@ -139,6 +149,9 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         assert 0 <= sloti < 256, "fast slot index need be in [0, 256)"  # TODO: heng, deal with EXTENDED_ARG?
         merged_code.append(sloti)
 
+    # MAKE_CELL location entries, 0b10000000 & 0b01111000
+    # @see Objects/locations.md
+    context['co_linetable'] += bytes([0b11111000] * len(c_cvs))
     context['co_codelen'] = len(merged_code)
 
     for idx, func in enumerate(funcs):
@@ -172,72 +185,92 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
             data['name_mapping_slot'][name] = i
 
         cocode = list(code_obj.co_code)
-        # cut tail which is not last function.
+        linetable = list(code_obj.co_linetable)
+        lti = 0  # linetable index
+        nei = next_entry_index(linetable, 0)
         is_last = idx == len(funcs) - 1
         cl = data["co_codelen"] = len(cocode)
 
-        # convert opcode
+        # convert opcode and maintain linetable
         tmpcode = []
         inserts = queue.Queue()
         jumps = []  # record jump opcode
         i = 0
+        tmplinetable = []
         while i < cl:
-            op = cocode[i]
-            if op >= opcode.HAVE_ARGUMENT:  # 有参 opcode
-                pi = i
-                while op == opcode.EXTENDED_ARG:
-                    pi += 2
-                    op = cocode[pi]
-                if op in opcode.hasjrel:
-                    jumps.append([i, len(tmpcode), pi + 2 - i, 0])
-                try:
-                    handler = REGISTER_HANDLES[op]
-                except:
-                    raise Exception(f"opcode [{op}]:{opcode.opname[op]} dont have converter.")
-                result, inserted = handler(cocode[i: pi + 2], context, data)
-                tmpcode.extend(result)
-                for _ in range(inserted):
-                    inserts.put(i)
-                i = pi + 2
-            elif op == opcode.opmap["RETURN_VALUE"] and not is_last:
-                if i < len(cocode) - 2:
-                    # repace return opcode in the middle of the not last function to avoid ending early
-                    pre_op = cocode[i - 2]
-                    if pre_op == opcode.opmap["LOAD_CONST"]:
-                        tmpcode = tmpcode[:-2]
-                        codes = make_jump_forward((cl - i) // 2)
-                        jumps.append([i, len(tmpcode), len(codes), 0])
-                        tmpcode.extend(codes)
-                        if len(codes) == 2:
-                            tmpcode.extend([opcode.opmap["NOP"]] * 2)
-                        else:
-                            inserted = (len(codes) - 4) // 2
-                        iat = i - 2
-                    else:
-                        codes = make_jump_forward((cl - i) // 2)
-                        inserted = (len(codes) - 2) // 2
-                        jumps.append([i, len(tmpcode), len(codes), 0])
-                        tmpcode.extend(codes)
-                        iat = i
-                    for _ in range(inserted):
-                        inserts.put(iat)
-                else:
-                    # replace tail RETURN_VALUE with NOP
-                    pre_op = cocode[i - 2]
-                    if pre_op == opcode.opmap['LOAD_CONST']:
-                        tmpcode = tmpcode[:-2]
-                        tmpcode.extend([opcode.opmap['NOP']] * 4)
-                    else:
-                        tmpcode.extend([opcode.opmap['NOP']] * 2)
+            fi = i
+            while cocode[fi] == opcode.opmap['EXTENDED_ARG']:
+                fi += 2
+            op = cocode[fi]
 
-                i += 2
+            if op >= opcode.HAVE_ARGUMENT:
+                if op in opcode.hasjrel:
+                    jumps.append([i, len(tmpcode), fi + 2 - i, 0])
+
+                if op == opcode.opmap['LOAD_CONST'] and cocode[fi + 2] == opcode.opmap['RETURN_VALUE'] and not is_last:
+                    codes = make_jump_forward((cl - i) // 2)
+                    jumps.append([i, len(tmpcode), len(codes), 0])
+                    tmpcode.extend(codes)
+                    pbs = linetable[lti:nei]
+                    pbs[0] &= 0b11111000
+                    pbs[0] |= (len(codes) // 2) - 1
+                    tmplinetable.extend(pbs)
+                    lti = nei
+                    nei = next_entry_index(linetable, lti)
+
+                    if (fi - i + 2) < len(codes):
+                        dels = (len(codes) - (fi - i + 2)) // 2
+                        for _ in range(dels):
+                            tmpcode.extend([opcode.opmap['NOP'], 0])
+                            # Number of instructions is increased, append a position entry.
+                            tmplinetable.append(0b10000000)
+                    else:
+                        inserted = (len(codes) - (fi - i + 2)) // 2
+                        for _ in range(inserted):
+                            inserts.put(i)
+                    # Replace RETURN_VALUE by NOP, to keep the number of instructions constant.
+                    tmpcode.extend([opcode.opmap['NOP'], 0])
+                    fi += 2
+                else:
+                    try:
+                        handler = REGISTER_HANDLES[op]
+                    except:
+                        raise Exception(f"opcode [{op}]:{opcode.opname[op]} dont have converter.")
+                    result, inserted = handler(cocode[i: fi + 2], context, data)
+                    tmpcode.extend(result)
+                    pbs = linetable[lti:nei]
+                    pbs[0] &= 0b11111000
+                    pbs[0] |= (len(result) // 2 + cache_entries[op]) - 1
+                    tmplinetable.extend(pbs)
+                    for _ in range(inserted):
+                        inserts.put(i)
+                fi += 2
             else:  # opcode with no argument.
-                tmpcode.extend(cocode[i : i + 2])
-                i += 2
+                if op == opcode.opmap['RETURN_VALUE'] and not is_last:
+                    # Replace with JUMP_FORWARD
+                    codes = make_jump_forward((cl - fi) // 2)
+                    inserted = (len(codes) - 2) // 2
+                    jumps.append([i, len(tmpcode), len(codes), 0])
+                    tmpcode.extend(codes)
+                    pbs = linetable[lti:nei]
+                    pbs[0] &= 0b11111000
+                    pbs[0] |= (len(codes) // 2 - 1)
+                    tmplinetable.extend(pbs)
+                    for _ in range(inserted):
+                        inserts.put(i)
+                else:
+                    tmpcode.extend(cocode[fi: fi + 2])
+                    tmplinetable.extend(linetable[lti:nei])
+                fi += 2
+
+            lti = nei
+            nei = next_entry_index(linetable, lti)
             # CACHE
             if cache_entries[op] > 0:
-                tmpcode.extend(cocode[i : i + cache_entries[op] * 2])
-                i += cache_entries[op] * 2
+                tmpcode.extend(cocode[fi: fi + cache_entries[op] * 2])
+                fi += cache_entries[op] * 2
+
+            i = fi
 
         # after converted, deal with relative jump opcode.
         allinserted = []
@@ -317,6 +350,7 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_stacksize"] = max(data["co_stacksize"], context["co_stacksize"])
         context["co_exceptiontable"] += write_exception_table(data["co_exceptiontable"])
         context["co_codelen"] = len(merged_code)
+        context['co_linetable'] += bytes(tmplinetable)
 
         # fix func globals has same key but different value
         if data["func_globals"]:
@@ -345,15 +379,14 @@ def merge_func(func_name, funcs, def_argcount=None, debug=1, merged_firstlineno=
         context["co_kwonlyargcount"],  # int, 函数的仅限关键字 形参 的数量（包括具有默认值的参数
         context["co_nlocals"],  # number of local varialbes (except cell)
         context["co_stacksize"] + 10,  # int, 取max_stacksize+1, +1 是为了避免内存crash
-        # context["co_stacksize"],  # int, 取max_stacksize+1, +1 是为了避免内存crash
         context["co_flags"],  # bitmap: 1=optimized | 2=newlocals | 4=*arg | 8=**arg
         context["co_code"],  # bytes of raw compiled bytecode
         context["co_consts"],  # tuple of constants used in the bytecode
         context["co_names"],  # tuple of names of local variables
         context["co_varnames"],  # tuple of names of arguments and local variables
-        "merge_funcion_generated.py",  # filename
+        f"merge_funcion_generated__{func_name}.py",  # filename
         func_name,  # str, function name
-        "",  # qualname
+        func_name,  # qualname
         merged_firstlineno,  # 需要能设置firstlino,否则tracy会无法正确识别函数名
         context['co_linetable'],  # co_linetable, encoded mapping of line numbers to bytecode indices
         context["co_exceptiontable"],  # co_exceptiontable, bytes
@@ -646,3 +679,4 @@ def _debug_func(f):
 
     print("== code ==")
     dis.dis(f)
+
